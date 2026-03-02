@@ -1,0 +1,658 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+SKILLS_HOME="${SKILLS_HOME:-$HOME/.team-skills}"
+SKILLS_CONFIG="$SKILLS_HOME/.skillsrc"
+SKILLS_AGENTS_FILE="$SKILLS_HOME/.agents"
+VERSION="0.2.0"
+
+# Tool registry: tool_key:display_name:skills_dir (relative to ~)
+TOOL_REGISTRY=(
+  "claude_code:Claude Code:.claude/skills"
+  "cursor:Cursor:.cursor/skills"
+  "codex:Codex:.codex/skills"
+  "openclaw:OpenClaw:.moltbot/skills"
+  "gemini_cli:Gemini CLI:.gemini/skills"
+  "windsurf:Windsurf:.codeium/windsurf/skills"
+  "opencode:OpenCode:.config/opencode/skills"
+  "github_copilot:GitHub Copilot:.copilot/skills"
+  "amp:Amp:.config/agents/skills"
+  "goose:Goose:.config/goose/skills"
+  "antigravity:Antigravity:.gemini/antigravity/global_skills"
+  "augment:Augment:.augment/rules"
+  "cline:Cline:.cline/skills"
+  "codebuddy:CodeBuddy:.codebuddy/skills"
+  "command_code:Command Code:.commandcode/skills"
+  "continue:Continue:.continue/skills"
+  "crush:Crush:.config/crush/skills"
+  "junie:Junie:.junie/skills"
+  "iflow_cli:iFlow CLI:.iflow/skills"
+  "kiro_cli:Kiro CLI:.kiro/skills"
+  "kode:Kode:.kode/skills"
+  "mcpjam:MCPJam:.mcpjam/skills"
+  "mistral_vibe:Mistral Vibe:.vibe/skills"
+  "mux:Mux:.mux/skills"
+  "openclaude:OpenClaude IDE:.openclaude/skills"
+  "openhands:OpenHands:.openhands/skills"
+  "pi:Pi:.pi/agent/skills"
+  "qoder:Qoder:.qoder/skills"
+  "qwen_code:Qwen Code:.qwen/skills"
+  "trae:Trae:.trae/skills"
+  "trae_cn:Trae CN:.trae-cn/skills"
+  "zencoder:Zencoder:.zencoder/skills"
+  "neovate:Neovate:.neovate/skills"
+  "pochi:Pochi:.pochi/skills"
+  "adal:AdaL:.adal/skills"
+  "kilo_code:Kilo Code:.kilocode/skills"
+  "roo_code:Roo Code:.roo/skills"
+  "clawdbot:Clawdbot:.clawdbot/skills"
+  "droid:Droid:.factory/skills"
+  "kimi_cli:Kimi Code CLI:.config/agents/skills"
+)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}→${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}!${NC} $*"; }
+err()   { echo -e "${RED}✗${NC} $*" >&2; }
+die()   { err "$@"; exit 1; }
+
+load_config() {
+  if [[ -f "$SKILLS_CONFIG" ]]; then
+    source "$SKILLS_CONFIG"
+  fi
+}
+
+save_config() {
+  cat > "$SKILLS_CONFIG" <<EOF
+# skills-cli config
+SKILLS_REMOTE="$SKILLS_REMOTE"
+EOF
+}
+
+ensure_repo() {
+  [[ -d "$SKILLS_HOME/skills" ]] || die "Skills repo not initialized. Run: skills init <git-url>"
+}
+
+# Detect which tool skill dirs exist on this machine, prints one per line
+detect_tools() {
+  for entry in "${TOOL_REGISTRY[@]}"; do
+    IFS=: read -r key name dir <<< "$entry"
+    local parent_dir
+    parent_dir="$HOME/$dir"
+    parent_dir="${parent_dir%/skills}"
+    if [[ -d "$parent_dir" ]]; then
+      echo "$entry"
+    fi
+  done
+}
+
+# Auto-detect which tool's skills dir we're in (for publish)
+detect_project_skills_dir() {
+  local project_root
+  project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+  
+  # Check common project-level skill dirs
+  for entry in "${TOOL_REGISTRY[@]}"; do
+    IFS=: read -r key name dir <<< "$entry"
+    local basename_dir
+    basename_dir=$(basename "$(dirname "$dir")")
+    local project_dir="$project_root/.$basename_dir/skills"
+    if [[ -d "$project_dir" ]]; then
+      echo "$project_dir"
+      return
+    fi
+  done
+  
+  # Fallback: check .claude/skills, .cursor/skills directly
+  for d in .claude/skills .cursor/skills .moltbot/skills; do
+    if [[ -d "$project_root/$d" ]]; then
+      echo "$project_root/$d"
+      return
+    fi
+  done
+  
+  return 1
+}
+
+# Load registered agents (one skills dir path per line)
+load_agents() {
+  [[ -f "$SKILLS_AGENTS_FILE" ]] || return
+  while IFS= read -r line; do
+    [[ -n "$line" && "$line" != \#* ]] && echo "$line"
+  done < "$SKILLS_AGENTS_FILE"
+}
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_init() {
+  local remote="${1:-}"
+  
+  if [[ -d "$SKILLS_HOME/skills" ]]; then
+    warn "Skills repo already exists at $SKILLS_HOME"
+    if [[ -n "$remote" ]]; then
+      info "Updating remote to: $remote"
+      cd "$SKILLS_HOME"
+      git remote set-url origin "$remote" 2>/dev/null || git remote add origin "$remote"
+      SKILLS_REMOTE="$remote"
+      save_config
+      ok "Remote updated"
+    fi
+    return
+  fi
+  
+  mkdir -p "$SKILLS_HOME"
+  
+  if [[ -n "$remote" ]]; then
+    info "Cloning $remote → $SKILLS_HOME"
+    git clone "$remote" "$SKILLS_HOME"
+    SKILLS_REMOTE="$remote"
+    save_config
+  else
+    info "Initializing new skills repo at $SKILLS_HOME"
+    cd "$SKILLS_HOME"
+    git init
+    mkdir -p skills
+    cat > skills/.gitkeep <<< ""
+    cat > README.md <<'HEREDOC'
+# Team Skills
+
+Shared agent skills managed by [skills-cli](https://github.com/your-org/skills-cli).
+
+## Structure
+
+```
+skills/
+├── skill-name/
+│   ├── SKILL.md        # Skill definition (required)
+│   ├── scripts/        # Supporting scripts
+│   └── ...
+```
+
+## Usage
+
+```bash
+skills pull              # Sync latest skills to all detected tools
+skills use <name>        # Link a skill into current project
+skills publish <name>    # Share a project skill with the team
+```
+HEREDOC
+    git add -A
+    git commit -m "Initial skills repo"
+    SKILLS_REMOTE=""
+    save_config
+  fi
+  
+  ok "Skills repo ready at $SKILLS_HOME"
+  
+  # Create skills/ dir if missing (cloned repo might have different structure)
+  mkdir -p "$SKILLS_HOME/skills"
+}
+
+cmd_pull() {
+  ensure_repo
+  load_config
+  
+  cd "$SKILLS_HOME"
+  
+  if [[ -n "${SKILLS_REMOTE:-}" ]] && git remote get-url origin &>/dev/null; then
+    info "Pulling latest from remote..."
+    git pull --ff-only || { warn "Pull failed — try resolving manually in $SKILLS_HOME"; }
+  else
+    warn "No remote configured, skipping git pull"
+  fi
+  
+  # Sync to all detected tools
+  info "Syncing skills to detected tools..."
+  local count=0
+  
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    IFS=: read -r key name dir <<< "$entry"
+    local target="$HOME/$dir"
+    mkdir -p "$target"
+    
+    for skill_dir in "$SKILLS_HOME"/skills/*/; do
+      [[ -d "$skill_dir" ]] || continue
+      local skill_name
+      skill_name=$(basename "$skill_dir")
+      local link_target="$target/$skill_name"
+      
+      if [[ -L "$link_target" ]]; then
+        # Already a symlink — check if pointing to right place
+        local current
+        current=$(readlink "$link_target")
+        if [[ "$current" == "$skill_dir" || "$current" == "${skill_dir%/}" ]]; then
+          continue
+        fi
+        rm "$link_target"
+      elif [[ -d "$link_target" ]]; then
+        warn "$name/$skill_name: exists as directory (skipping, use --force to overwrite)"
+        continue
+      fi
+      
+      ln -sfn "${skill_dir%/}" "$link_target"
+      count=$((count+1))
+    done
+  done < <(detect_tools)
+  
+  # Also sync to registered agent dirs
+  while IFS= read -r agent_dir; do
+    [[ -n "$agent_dir" && -d "$agent_dir" ]] || continue
+    for skill_dir in "$SKILLS_HOME"/skills/*/; do
+      [[ -d "$skill_dir" ]] || continue
+      local skill_name
+      skill_name=$(basename "$skill_dir")
+      local link_target="$agent_dir/$skill_name"
+
+      if [[ -L "$link_target" ]]; then
+        local current
+        current=$(readlink "$link_target")
+        [[ "$current" == "$skill_dir" || "$current" == "${skill_dir%/}" ]] && continue
+        rm "$link_target"
+      elif [[ -d "$link_target" ]]; then
+        warn "$agent_dir/$skill_name: exists as directory (skipping)"
+        continue
+      fi
+
+      ln -sfn "${skill_dir%/}" "$link_target"
+      count=$((count+1))
+    done
+  done < <(load_agents)
+
+  ok "Synced to detected tools + agents ($count new links)"
+}
+
+cmd_push() {
+  ensure_repo
+  load_config
+  
+  cd "$SKILLS_HOME"
+  
+  if git diff --quiet && git diff --cached --quiet; then
+    info "No changes to push"
+    return
+  fi
+  
+  echo ""
+  git status --short
+  echo ""
+  
+  local msg="${1:-Update skills}"
+  
+  git add -A
+  git commit -m "$msg"
+  
+  if git remote get-url origin &>/dev/null; then
+    local branch
+    branch=$(git branch --show-current)
+    
+    if [[ "${PR:-}" == "1" || "${2:-}" == "--pr" ]]; then
+      # Push to a branch and create PR
+      local pr_branch="skill-update/$(date +%s)"
+      git checkout -b "$pr_branch"
+      git push -u origin "$pr_branch"
+      info "Creating PR..."
+      if command -v gh &>/dev/null; then
+        gh pr create --title "$msg" --body "Skill update via skills-cli"
+      else
+        warn "gh CLI not found — push to $pr_branch done, create PR manually"
+      fi
+      git checkout "$branch"
+    else
+      git push
+      ok "Pushed to remote"
+    fi
+  else
+    ok "Committed locally (no remote configured)"
+  fi
+}
+
+cmd_publish() {
+  local name="${1:-}"
+  ensure_repo
+  
+  if [[ -z "$name" ]]; then
+    die "Usage: skills publish <skill-name> [--from <path>]"
+  fi
+  
+  local src=""
+  
+  # Check --from flag
+  if [[ "${2:-}" == "--from" && -n "${3:-}" ]]; then
+    src="${3}"
+  else
+    # Auto-detect: check current project skills dirs
+    local project_root
+    project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+    
+    for d in .claude/skills .cursor/skills .moltbot/skills .codex/skills; do
+      if [[ -d "$project_root/$d/$name" ]]; then
+        src="$project_root/$d/$name"
+        break
+      fi
+    done
+    
+    # Also check if name is a direct path
+    if [[ -z "$src" && -d "$name" ]]; then
+      src="$name"
+      name=$(basename "$name")
+    fi
+  fi
+  
+  [[ -n "$src" ]] || die "Skill '$name' not found in project. Use: skills publish <name> --from <path>"
+  [[ -f "$src/SKILL.md" ]] || warn "No SKILL.md in $src (not required, but recommended)"
+  
+  local dest="$SKILLS_HOME/skills/$name"
+  
+  if [[ -d "$dest" ]]; then
+    warn "Skill '$name' already exists in team repo — overwriting"
+    rm -rf "$dest"
+  fi
+  
+  # Copy to team repo
+  cp -r "$src" "$dest"
+  ok "Copied $src → $dest"
+  
+  # Replace local copy with symlink (if it was in a project dir, not a standalone path)
+  if [[ "$src" != "$name" && ! -L "$src" ]]; then
+    rm -rf "$src"
+    ln -sfn "$dest" "$src"
+    ok "Replaced local copy with symlink"
+  fi
+  
+  # Commit
+  cd "$SKILLS_HOME"
+  git add "skills/$name"
+  git commit -m "Add skill: $name"
+  
+  if git remote get-url origin &>/dev/null; then
+    info "Push with: skills push"
+    info "Or create PR: skills push --pr"
+  fi
+  
+  ok "Skill '$name' published to team repo"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  ensure_repo
+  
+  [[ -n "$name" ]] || die "Usage: skills use <skill-name> [<skill-name>...]"
+  
+  local project_root
+  project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+  
+  # Determine target dir — prefer .claude/skills if exists, else create it
+  local target_dir=""
+  for d in .claude/skills .cursor/skills .moltbot/skills; do
+    if [[ -d "$project_root/$d" ]]; then
+      target_dir="$project_root/$d"
+      break
+    fi
+  done
+  
+  if [[ -z "$target_dir" ]]; then
+    target_dir="$project_root/.claude/skills"
+    mkdir -p "$target_dir"
+    info "Created $target_dir"
+  fi
+  
+  for skill_name in "$@"; do
+    local src="$SKILLS_HOME/skills/$skill_name"
+    [[ -d "$src" ]] || { warn "Skill '$skill_name' not found in team repo — skipping"; continue; }
+    
+    local link="$target_dir/$skill_name"
+    if [[ -e "$link" ]]; then
+      warn "'$skill_name' already exists in project — skipping"
+      continue
+    fi
+    
+    ln -sfn "$src" "$link"
+    ok "Linked $skill_name → $target_dir/$skill_name"
+  done
+}
+
+cmd_list() {
+  ensure_repo
+  
+  echo -e "${BOLD}Team Skills${NC} ($SKILLS_HOME/skills/)"
+  echo ""
+  
+  local has_skills=false
+  for skill_dir in "$SKILLS_HOME"/skills/*/; do
+    [[ -d "$skill_dir" ]] || continue
+    has_skills=true
+    local name
+    name=$(basename "$skill_dir")
+    
+    # Read first line of SKILL.md for description
+    local desc=""
+    if [[ -f "$skill_dir/SKILL.md" ]]; then
+      desc=$(head -1 "$skill_dir/SKILL.md" | sed 's/^#\+\s*//')
+    fi
+    
+    # Check sync status
+    local synced_to=()
+    for entry in "${TOOL_REGISTRY[@]}"; do
+      IFS=: read -r key tname dir <<< "$entry"
+      local link="$HOME/$dir/$name"
+      if [[ -L "$link" ]]; then
+        synced_to+=("$tname")
+      fi
+    done
+    
+    local sync_info=""
+    if [[ ${#synced_to[@]} -gt 0 ]]; then
+      sync_info="${GREEN}→ $(IFS=', '; echo "${synced_to[*]}")${NC}"
+    else
+      sync_info="${YELLOW}(not synced)${NC}"
+    fi
+    
+    echo -e "  ${BOLD}$name${NC}  $desc"
+    echo -e "    $sync_info"
+  done
+  
+  if ! $has_skills; then
+    echo "  (no skills yet)"
+    echo ""
+    echo "  Add one with: skills publish <name> --from <path>"
+  fi
+}
+
+cmd_agent() {
+  local subcmd="${1:-list}"
+  shift || true
+
+  case "$subcmd" in
+    add)
+      local agent_path="${1:-}"
+      local agent_name="${2:-}"
+      [[ -n "$agent_path" ]] || die "Usage: skills agent add <skills-dir> [name]"
+
+      # Resolve to absolute path
+      agent_path=$(cd "$agent_path" 2>/dev/null && pwd || echo "$agent_path")
+
+      # Check if it's a directory (create if needed)
+      if [[ ! -d "$agent_path" ]]; then
+        mkdir -p "$agent_path"
+        info "Created $agent_path"
+      fi
+
+      # Add label as comment if provided
+      touch "$SKILLS_AGENTS_FILE"
+      if grep -qxF "$agent_path" "$SKILLS_AGENTS_FILE" 2>/dev/null; then
+        warn "Already registered: $agent_path"
+        return
+      fi
+
+      if [[ -n "$agent_name" ]]; then
+        echo "# $agent_name" >> "$SKILLS_AGENTS_FILE"
+      fi
+      echo "$agent_path" >> "$SKILLS_AGENTS_FILE"
+      ok "Registered agent skills dir: $agent_path"
+      ;;
+    remove|rm)
+      local agent_path="${1:-}"
+      [[ -n "$agent_path" ]] || die "Usage: skills agent remove <skills-dir>"
+      agent_path=$(cd "$agent_path" 2>/dev/null && pwd || echo "$agent_path")
+
+      if [[ -f "$SKILLS_AGENTS_FILE" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        grep -vxF "$agent_path" "$SKILLS_AGENTS_FILE" > "$tmp" || true
+        mv "$tmp" "$SKILLS_AGENTS_FILE"
+        ok "Removed: $agent_path"
+      fi
+      ;;
+    list|ls)
+      echo -e "${BOLD}Registered Agent Skills Dirs:${NC}"
+      echo ""
+      if [[ ! -f "$SKILLS_AGENTS_FILE" ]] || [[ ! -s "$SKILLS_AGENTS_FILE" ]]; then
+        echo "  (none)"
+        echo ""
+        echo "  Register with: skills agent add <path-to-skills-dir> [name]"
+        return
+      fi
+      local label=""
+      while IFS= read -r line; do
+        if [[ "$line" == \#* ]]; then
+          label="${line#\# }"
+          continue
+        fi
+        [[ -n "$line" ]] || continue
+        local skill_count=0
+        if [[ -d "$line" ]]; then
+          for s in "$line"/*/; do [[ -d "$s" ]] && skill_count=$((skill_count+1)) || true; done
+          local display="${BOLD}$line${NC}"
+          [[ -n "$label" ]] && display="${BOLD}$label${NC} → $line"
+          echo -e "  ${GREEN}●${NC} $display ($skill_count skills)"
+        else
+          local display="$line"
+          [[ -n "$label" ]] && display="$label → $line"
+          echo -e "  ${RED}●${NC} $display (not found)"
+        fi
+        label=""
+      done < "$SKILLS_AGENTS_FILE"
+      ;;
+    *)
+      die "Usage: skills agent [add|remove|list]"
+      ;;
+  esac
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  ensure_repo
+  
+  [[ -n "$name" ]] || die "Usage: skills remove <skill-name>"
+  
+  local src="$SKILLS_HOME/skills/$name"
+  [[ -d "$src" ]] || die "Skill '$name' not found"
+  
+  # Remove symlinks from all tools
+  for entry in "${TOOL_REGISTRY[@]}"; do
+    IFS=: read -r key tname dir <<< "$entry"
+    local link="$HOME/$dir/$name"
+    if [[ -L "$link" ]]; then
+      rm "$link"
+      info "Removed link from $tname"
+    fi
+  done
+  
+  rm -rf "$src"
+  cd "$SKILLS_HOME"
+  git add -A
+  git commit -m "Remove skill: $name"
+  
+  ok "Skill '$name' removed"
+}
+
+cmd_status() {
+  echo -e "${BOLD}Skills CLI v$VERSION${NC}"
+  echo ""
+  
+  if [[ -d "$SKILLS_HOME" ]]; then
+    echo -e "  Repo: ${GREEN}$SKILLS_HOME${NC}"
+    load_config
+    if [[ -n "${SKILLS_REMOTE:-}" ]]; then
+      echo -e "  Remote: $SKILLS_REMOTE"
+    else
+      echo -e "  Remote: ${YELLOW}(none)${NC}"
+    fi
+    
+    local count=0
+    for d in "$SKILLS_HOME"/skills/*/; do
+      [[ -d "$d" ]] && count=$((count+1))
+    done
+    echo -e "  Skills: $count"
+  else
+    echo -e "  Repo: ${RED}not initialized${NC}"
+    echo "  Run: skills init [<git-url>]"
+  fi
+  
+  echo ""
+  echo -e "${BOLD}Detected Tools:${NC}"
+  for entry in "${TOOL_REGISTRY[@]}"; do
+    IFS=: read -r key name dir <<< "$entry"
+    local detect_dir="$HOME/$dir"
+    detect_dir="${detect_dir%/skills}"
+    if [[ -d "$detect_dir" ]]; then
+      local skill_count=0
+      if [[ -d "$HOME/$dir" ]]; then
+        for s in "$HOME/$dir"/*/; do
+          [[ -d "$s" ]] && skill_count=$((skill_count+1))
+        done
+      fi
+      echo -e "  ${GREEN}●${NC} $name ($skill_count skills)"
+    fi
+  done
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  init)     cmd_init "$@" ;;
+  pull)     cmd_pull "$@" ;;
+  push)     cmd_push "$@" ;;
+  publish)  cmd_publish "$@" ;;
+  use)      cmd_use "$@" ;;
+  list|ls)  cmd_list "$@" ;;
+  agent)    cmd_agent "$@" ;;
+  remove|rm) cmd_remove "$@" ;;
+  status|st) cmd_status "$@" ;;
+  help|--help|-h)
+    echo "skills — Team skill manager for AI coding tools"
+    echo ""
+    echo "Usage: skills <command> [args]"
+    echo ""
+    echo "Commands:"
+    echo "  init [<git-url>]       Initialize skills repo (clone or create)"
+    echo "  pull                   Fetch latest + sync to all detected tools"
+    echo "  push [msg] [--pr]      Commit & push changes (--pr for pull request)"
+    echo "  publish <name> [--from <path>]  Share a project skill with the team"
+    echo "  use <name> [<name>...] Link team skill(s) into current project"
+    echo "  list                   Show all skills and sync status"
+    echo "  agent add <dir> [name] Register an agent's skills directory"
+    echo "  agent remove <dir>     Unregister an agent skills directory"
+    echo "  agent list             Show registered agents"
+    echo "  remove <name>          Remove a skill from team repo"
+    echo "  status                 Show repo info and detected tools"
+    echo ""
+    echo "Environment:"
+    echo "  SKILLS_HOME            Skills repo location (default: ~/.team-skills)"
+    ;;
+  *)
+    die "Unknown command: $cmd (try: skills help)"
+    ;;
+esac
