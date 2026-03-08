@@ -434,22 +434,43 @@ cmd_list() {
     local name
     name=$(basename "$skill_dir")
     
-    # Read first line of SKILL.md for description
+    # Parse description from YAML frontmatter or first heading
     local desc=""
     if [[ -f "$skill_dir/SKILL.md" ]]; then
-      desc=$(head -1 "$skill_dir/SKILL.md" | sed 's/^#\+\s*//')
+      # Try YAML frontmatter: description: ...
+      desc=$(awk '/^---/{if(seen++) exit; next} /^description:/{sub(/^description:[[:space:]]*/,""); gsub(/^"|"$/,""); print; exit}' "$skill_dir/SKILL.md")
+      # Fallback: first markdown heading
+      if [[ -z "$desc" ]]; then
+        desc=$(grep -m1 '^#' "$skill_dir/SKILL.md" | sed 's/^#\+[[:space:]]*//')
+      fi
     fi
-    
-    # Check sync status
+
+    # Check sync status — count symlinks AND real directories (pre-existing)
     local synced_to=()
     for entry in "${TOOL_REGISTRY[@]}"; do
       IFS=: read -r key tname dir <<< "$entry"
       local link="$HOME/$dir/$name"
-      if [[ -L "$link" ]]; then
+      if [[ -L "$link" || -d "$link" ]]; then
         synced_to+=("$tname")
       fi
     done
-    
+    # Also check registered agents
+    if [[ -f "$SKILLS_AGENTS_FILE" ]]; then
+      local agent_label=""
+      while IFS= read -r agent_line; do
+        if [[ "$agent_line" == \#* ]]; then
+          agent_label="${agent_line#\# }"
+          continue
+        fi
+        [[ -n "$agent_line" ]] || continue
+        local agent_link="$agent_line/$name"
+        if [[ -L "$agent_link" || -d "$agent_link" ]]; then
+          synced_to+=("${agent_label:-$agent_line}")
+        fi
+        agent_label=""
+      done < "$SKILLS_AGENTS_FILE"
+    fi
+
     local sync_info=""
     if [[ ${#synced_to[@]} -gt 0 ]]; then
       sync_info="${GREEN}→ $(IFS=', '; echo "${synced_to[*]}")${NC}"
@@ -615,6 +636,30 @@ cmd_status() {
       echo -e "  ${GREEN}●${NC} $name ($skill_count skills)"
     fi
   done
+
+  # Also show registered agents
+  if [[ -f "$SKILLS_AGENTS_FILE" ]] && [[ -s "$SKILLS_AGENTS_FILE" ]]; then
+    echo ""
+    echo -e "${BOLD}Registered Agents:${NC}"
+    local label=""
+    while IFS= read -r line; do
+      if [[ "$line" == \#* ]]; then
+        label="${line#\# }"
+        continue
+      fi
+      [[ -n "$line" ]] || continue
+      local skill_count=0
+      for s in "$line"/*/; do [[ -d "$s" ]] && skill_count=$((skill_count+1)) || true; done
+      local display="${BOLD}${label:-$line}${NC}"
+      [[ -n "$label" && "$label" != "$line" ]] && display="${BOLD}$label${NC} ($line)"
+      if [[ -d "$line" ]]; then
+        echo -e "  ${GREEN}●${NC} $display ($skill_count skills)"
+      else
+        echo -e "  ${RED}●${NC} $display ${RED}(dir not found)${NC}"
+      fi
+      label=""
+    done < "$SKILLS_AGENTS_FILE"
+  fi
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
